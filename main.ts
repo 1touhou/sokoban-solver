@@ -248,3 +248,297 @@ function heapPop(heap: [number, number, number][]): [number, number, number] {
 }
 
 /** Push-optimal solution of a level: {pushes, moves}, or null when the search gives up. */
+function solvePush(
+  wall: Uint8Array,
+  goals: number[],
+  boxes0: number[],
+  player0: number,
+  w: number,
+  h: number,
+  maxStates: number,
+): { pushes: number; moves: string } | null {
+  const size = w * h;
+  const goal = new Uint8Array(size);
+  for (const g of goals) goal[g] = 1;
+  const live = liveSquares(wall, goals, w, h);
+  const boxes = boxes0.slice().sort((a, b) => a - b);
+  if (boxes.some((b) => !live[b])) return null;
+  const solved = (bs: number[]): boolean => bs.every((b) => goal[b]);
+  if (solved(boxes)) return { pushes: 0, moves: '' };
+  const dist = goalDistances(wall, goals, w, h);
+  const perms = permutations(goals.length);
+  const numericKey = Math.pow(size, boxes.length + 1) < Number.MAX_SAFE_INTEGER;
+  const keyOf = (bs: number[], low: number): number | string => {
+    if (numericKey) {
+      let k = low;
+      for (const b of bs) k = k * size + b;
+      return k;
+    }
+    return `${low}|${bs.join(',')}`;
+  };
+
+  const seen = new Int32Array(size);
+  const mark = new Int32Array(size);
+  const stack = new Int32Array(size);
+  const occupied = new Uint8Array(size);
+  let stamp = 0;
+
+  const sBoxes: number[][] = [boxes];
+  const sPlayer: number[] = [player0];
+  const sParent: number[] = [-1];
+  const sKey: (number | string)[] = [];
+  const sDone: number[] = [0];
+  const best = new Map<number | string, number>();
+  const heap: [number, number, number][] = [];
+
+  for (const b of boxes) occupied[b] = 1;
+  const low0 = reachLow(wall, occupied, player0, w, h, seen, ++stamp, stack);
+  for (const b of boxes) occupied[b] = 0;
+  const k0 = keyOf(boxes, low0);
+  sKey.push(k0);
+  best.set(k0, 0);
+  const h0 = matchingCost(boxes, dist, perms);
+  if (h0 === Infinity) return null;
+  heapPush(heap, [h0, 0, 0]);
+
+  let found = -1;
+  let expanded = 0;
+  while (heap.length > 0) {
+    const [, g, s] = heapPop(heap);
+    if (best.get(sKey[s]!) !== g || sDone[s]) continue;
+    sDone[s] = 1;
+    const bs = sBoxes[s]!;
+    if (solved(bs)) {
+      found = s;
+      break;
+    }
+    if (expanded >= maxStates) return null;
+    expanded++;
+    const player = sPlayer[s]!;
+    for (const b of bs) occupied[b] = 1;
+    reachLow(wall, occupied, player, w, h, seen, ++stamp, stack);
+    const here = stamp;
+    for (let bi = 0; bi < bs.length && found < 0; bi++) {
+      const b = bs[bi]!;
+      for (let d = 0; d < 4; d++) {
+        const behind = stepFrom(b, d ^ 1, w, h);
+        const t = stepFrom(b, d, w, h);
+        if (behind < 0 || t < 0 || seen[behind] !== here || wall[t] || occupied[t] || !live[t]) continue;
+        occupied[b] = 0;
+        occupied[t] = 1;
+        if (frozenBlock(wall, occupied, goal, t, w, size)) {
+          occupied[t] = 0;
+          occupied[b] = 1;
+          continue;
+        }
+        const nb = bs.slice();
+        nb[bi] = t;
+        nb.sort((a, b2) => a - b2);
+        const low = reachLow(wall, occupied, b, w, h, mark, ++stamp, stack);
+        occupied[t] = 0;
+        occupied[b] = 1;
+        const g2 = g + 1;
+        const k = keyOf(nb, low);
+        const prev = best.get(k);
+        if (prev !== undefined && prev <= g2) continue;
+        const h2 = matchingCost(nb, dist, perms);
+        if (h2 === Infinity) continue;
+        best.set(k, g2);
+        const idx = sBoxes.length;
+        sBoxes.push(nb);
+        sPlayer.push(b);
+        sParent.push(s);
+        sKey.push(k);
+        sDone.push(0);
+        heapPush(heap, [g2 + h2, g2, idx]);
+        if (solved(nb)) {
+          found = idx;
+          break;
+        }
+      }
+    }
+    for (const b of bs) occupied[b] = 0;
+    if (found >= 0) break;
+  }
+  if (found < 0) return null;
+
+  const path: number[] = [];
+  for (let s = found; s > 0; s = sParent[s]!) path.push(s);
+  path.reverse();
+  let moves = '';
+  let player = player0;
+  let cur = boxes;
+  for (const s of path) {
+    const nb = sBoxes[s]!;
+    const from = cur.find((b) => !nb.includes(b))!;
+    const to = nb.find((b) => !cur.includes(b))!;
+    const d = to - from === -w ? 0 : to - from === w ? 1 : to - from === -1 ? 2 : 3;
+    for (const b of cur) occupied[b] = 1;
+    moves += walkTo(wall, occupied, player, stepFrom(from, d ^ 1, w, h)!, w, h);
+    for (const b of cur) occupied[b] = 0;
+    moves += LETTER[d]!;
+    player = from;
+    cur = nb;
+  }
+  return { pushes: path.length, moves };
+}
+
+interface Room {
+  squares: number[];
+  boxes: number[];
+  goals: number[];
+  done: boolean;
+}
+
+/** The level's rooms: cut the hallway row's dead squares out of the floor, and each part left holding boxes is a room. */
+function roomsOf(level: Level): Room[] | null {
+  const { w, h, wall, goals, boxes, player } = level;
+  const size = w * h;
+  const live = liveSquares(wall, goals, w, h);
+  const row = (player / w) | 0;
+  const cut = new Uint8Array(size);
+  for (let x = 0; x < w; x++) {
+    const i = row * w + x;
+    if (!wall[i] && !live[i]) cut[i] = 1;
+  }
+  if (boxes.some((b) => cut[b])) return null;
+  const part = new Int32Array(size).fill(-1);
+  const rooms: Room[] = [];
+  for (let s = 0; s < size; s++) {
+    if (wall[s] || cut[s] || part[s] >= 0) continue;
+    const squares = [s];
+    part[s] = rooms.length;
+    for (let i = 0; i < squares.length; i++) {
+      for (let d = 0; d < 4; d++) {
+        const q = stepFrom(squares[i]!, d, w, h);
+        if (q >= 0 && !wall[q] && !cut[q] && part[q] < 0) {
+          part[q] = rooms.length;
+          squares.push(q);
+        }
+      }
+    }
+    rooms.push({ squares, boxes: [], goals: [], done: false });
+  }
+  for (const b of boxes) rooms[part[b]!]!.boxes.push(b);
+  for (const g of goals) {
+    if (part[g]! < 0) return null;
+    rooms[part[g]!]!.goals.push(g);
+  }
+  if (rooms.some((r) => r.boxes.length !== r.goals.length)) return null;
+  return rooms.filter((r) => r.boxes.length > 0);
+}
+
+/** The player's square after playing `moves` from `player`. */
+function endOf(w: number, h: number, player: number, moves: string): number {
+  let p = player;
+  for (const ch of moves) {
+    const d = 'udlr'.indexOf(ch);
+    if (d < 0) continue;
+    const q = stepFrom(p, d, w, h);
+    if (q >= 0) p = q;
+  }
+  return p;
+}
+
+/** Solve room by room, the other rooms' boxes standing as walls (on their goals once done). */
+function solveByRooms(level: Level, maxStates: number): { pushes: number; moves: string } | null {
+  const rooms = roomsOf(level);
+  if (rooms === null) return solvePush(level.wall, level.goals, level.boxes, level.player, level.w, level.h, LEVEL_STATES);
+  let player = level.player;
+  let moves = '';
+  let pushes = 0;
+  for (const room of rooms) {
+    const wall = level.wall.slice();
+    for (const other of rooms) {
+      if (other === room) continue;
+      for (const b of other.done ? other.goals : other.boxes) wall[b] = 1;
+    }
+    const sub = solvePush(wall, room.goals.slice().sort((a, b) => a - b), room.boxes.slice().sort((a, b) => a - b), player, level.w, level.h, maxStates);
+    if (sub === null) return null;
+    moves += sub.moves;
+    pushes += sub.pushes;
+    player = endOf(level.w, level.h, player, sub.moves);
+    room.done = true;
+  }
+  return { pushes, moves };
+}
+
+/** Last resort: A* over moves (fewest steps, not pushes), so a level still gets an answer. */
+function solveMoves(level: Level, maxStates: number): string | null {
+  const { w, h, wall, goals } = level;
+  const size = w * h;
+  const goal = new Uint8Array(size);
+  for (const g of goals) goal[g] = 1;
+  const dist = (b: number): number => {
+    let m = Infinity;
+    for (const g of goals) m = Math.min(m, Math.abs((g % w) - (b % w)) + Math.abs(((g / w) | 0) - ((b / w) | 0)));
+    return m;
+  };
+  const est = (bs: number[]): number => bs.reduce((a, b) => a + dist(b), 0);
+  const keyOf = (p: number, bs: number[]): string => `${p}|${bs.join(',')}`;
+  const boxes0 = level.boxes.slice().sort((a, b) => a - b);
+  const sp: number[] = [level.player];
+  const sb: number[][] = [boxes0];
+  const parent: number[] = [-1];
+  const step: string[] = [''];
+  const done = new Set<number>();
+  const best = new Map<string, number>([[keyOf(level.player, boxes0), 0]]);
+  const heap: [number, number, number][] = [];
+  heapPush(heap, [est(boxes0), 0, 0]);
+  let expanded = 0;
+  while (heap.length > 0) {
+    const [, g, s] = heapPop(heap);
+    if (best.get(keyOf(sp[s]!, sb[s]!)) !== g || done.has(s)) continue;
+    done.add(s);
+    const bs = sb[s]!;
+    if (bs.every((b) => goal[b])) {
+      let moves = '';
+      for (let t = s; t > 0; t = parent[t]!) moves = step[t]! + moves;
+      return moves;
+    }
+    if (expanded >= maxStates) return null;
+    expanded++;
+    const p = sp[s]!;
+    for (let d = 0; d < 4; d++) {
+      const q = stepFrom(p, d, w, h);
+      if (q < 0 || wall[q]) continue;
+      let nb = bs;
+      const at = bs.indexOf(q);
+      if (at >= 0) {
+        const t = stepFrom(q, d, w, h);
+        if (t < 0 || wall[t] || bs.includes(t)) continue;
+        nb = bs.slice();
+        nb[at] = t;
+        nb.sort((a, b) => a - b);
+      }
+      const k = keyOf(q, nb);
+      const prev = best.get(k);
+      if (prev !== undefined && prev <= g + 1) continue;
+      const t = sp.length;
+      sp.push(q);
+      sb.push(nb);
+      parent.push(s);
+      step.push(LETTER[d]!);
+      best.set(k, g + 1);
+      heapPush(heap, [g + 1 + est(nb), g + 1, t]);
+    }
+  }
+  return null;
+}
+
+/** The moves for one level: room by room when the level splits, else the whole level, else a move search. */
+function solveLevel(text: string): string {
+  const level = parseLevel(text);
+  if (level.boxes.length === 0) return '';
+  const byRooms = solveByRooms(level, ROOM_STATES);
+  if (byRooms !== null) return byRooms.moves;
+  const whole = solvePush(level.wall, level.goals, level.boxes, level.player, level.w, level.h, LEVEL_STATES);
+  if (whole !== null) return whole.moves;
+  return solveMoves(level, MOVE_STATES) ?? '';
+}
+
+for (const id of readdirSync(I).sort()) {
+  const moves = solveLevel(readFileSync(join(I, id, 'level.txt'), 'utf8'));
+  mkdirSync(join(O, id), { recursive: true });
+  writeFileSync(join(O, id, 'solution.txt'), `${moves}\n`);
+}
